@@ -36,6 +36,14 @@ Notable Changes
 
 Bug Fixes
 
+* Fix statement splitting of MySQL ``REPEAT ... UNTIL ... END REPEAT``
+  blocks. ``REPEAT`` was not part of the block pairing logic, so a
+  standalone block was split into three statements and a block inside
+  ``BEGIN ... END`` left the closing ``END`` as an orphan statement.
+  ``REPEAT``, its ``UNTIL`` boundary and ``END REPEAT`` are now part of a
+  table-driven block pairing, including nested forms such as ``REPEAT``
+  containing ``WHILE`` and ``UNTIL`` conditions containing a ``CASE``
+  expression. Splitting of the other control-flow blocks is unchanged.
 * Fix `IndexError` and `ValueError` in `format()` on some malformed
   statements, e.g. `( as )` with `reindent=True` or a `CASE` without its
   own `END` with `reindent_aligned=True`. Grouping no longer moves the

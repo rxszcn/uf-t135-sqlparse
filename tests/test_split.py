@@ -374,3 +374,260 @@ def test_split_standalone_for_update():
     assert stmts[1] == "SELECT 3;"
 
 
+# ---------------------------------------------------------------------------
+# Block pairing matrix: every control-flow block, standalone and inside a
+# BEGIN ... END body.  A block inside a body has always been kept together
+# with the enclosing statement; a standalone block has always been split at
+# its inner semicolons.  Both shapes are pinned here so a change to the
+# pairing table cannot regress one dialect while fixing another.
+# ---------------------------------------------------------------------------
+BLOCK_MATRIX = [
+    # name, header, body statement, closing keyword
+    ('if', 'IF x = 1 THEN', 'SET x = 1;', 'END IF'),
+    ('while_do', 'WHILE x < 5 DO', 'SET x = x + 1;', 'END WHILE'),
+    ('while_loop', 'WHILE x < 5 LOOP', 'x := x + 1;', 'END LOOP'),
+    ('loop', 'LOOP', 'SELECT 1;', 'END LOOP'),
+    ('for_loop', 'FOR i IN 1..10 LOOP', 'SELECT 1;', 'END LOOP'),
+    ('for_do', 'FOR r DO', 'SELECT 1;', 'END FOR'),
+    ('case', 'CASE x', 'WHEN 1 THEN SET y = 1;', 'END CASE'),
+    ('repeat', 'REPEAT', 'SET x = x + 1;', 'UNTIL x > 10 END REPEAT'),
+]
+
+
+@pytest.mark.parametrize('name, header, body, closer', BLOCK_MATRIX)
+def test_split_block_matrix_standalone(name, header, body, closer):
+    """Standalone blocks keep their historical three-statement split.
+
+    Every control-flow block except REPEAT was split at its inner
+    semicolons before the pairing table existed; that behavior is kept
+    verbatim.  REPEAT is paired now, so it forms one statement.
+    """
+    sql = f'{header}\n  {body}\n{closer};\nSELECT 2;'
+    stmts = sqlparse.split(sql)
+    assert stmts[-1] == 'SELECT 2;'
+    if name == 'repeat':
+        assert stmts == [f'{header}\n  {body}\n{closer};', 'SELECT 2;']
+    else:
+        assert stmts == [f'{header}\n  {body}', f'{closer};', 'SELECT 2;']
+
+
+@pytest.mark.parametrize('name, header, body, closer', BLOCK_MATRIX)
+def test_split_block_matrix_in_begin(name, header, body, closer):
+    """A block inside BEGIN ... END stays part of the enclosing statement."""
+    sql = (f'CREATE PROCEDURE p()\nBEGIN\n  {header}\n    {body}\n'
+           f'  {closer};\n  SELECT 3;\nEND;\nSELECT 2;')
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2, (name, stmts)
+    assert stmts[0].startswith('CREATE PROCEDURE p()')
+    assert stmts[0].endswith('END;')
+    assert stmts[1] == 'SELECT 2;'
+
+
+# ---------------------------------------------------------------------------
+# MySQL REPEAT ... UNTIL ... END REPEAT
+# ---------------------------------------------------------------------------
+def test_split_repeat_standalone():
+    sql = 'REPEAT\n  SET x = x + 1;\nUNTIL x > 10 END REPEAT;\nSELECT 2;'
+    stmts = sqlparse.split(sql)
+    assert stmts == [
+        'REPEAT\n  SET x = x + 1;\nUNTIL x > 10 END REPEAT;',
+        'SELECT 2;',
+    ]
+
+
+def test_split_repeat_in_begin():
+    sql = ('CREATE PROCEDURE p()\n'
+           'BEGIN\n'
+           '  REPEAT\n'
+           '    SET x = x + 1;\n'
+           '  UNTIL x > 10 END REPEAT;\n'
+           'END;\n'
+           'SELECT 2;')
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2
+    assert stmts[0] == ('CREATE PROCEDURE p()\n'
+                        'BEGIN\n'
+                        '  REPEAT\n'
+                        '    SET x = x + 1;\n'
+                        '  UNTIL x > 10 END REPEAT;\n'
+                        'END;')
+    assert stmts[1] == 'SELECT 2;'
+
+
+@pytest.mark.parametrize('sql', [
+    # REPEAT containing WHILE ... DO
+    ('BEGIN\n'
+     '  REPEAT\n'
+     '    WHILE x < 5 DO\n'
+     '      SET x = x + 1;\n'
+     '    END WHILE;\n'
+     '  UNTIL x > 10 END REPEAT;\n'
+     'END;\n'
+     'SELECT 2;'),
+    # ... same without the BEGIN wrapper
+    ('REPEAT\n'
+     '  WHILE x < 5 DO\n'
+     '    SET x = x + 1;\n'
+     '  END WHILE;\n'
+     'UNTIL x > 10 END REPEAT;\n'
+     'SELECT 2;'),
+    # REPEAT containing IF
+    ('BEGIN\n'
+     '  REPEAT\n'
+     '    IF x > 0 THEN\n'
+     '      SET x = x - 1;\n'
+     '    END IF;\n'
+     '  UNTIL x = 0 END REPEAT;\n'
+     'END;\n'
+     'SELECT 2;'),
+    # REPEAT containing LOOP
+    ('BEGIN\n'
+     '  REPEAT\n'
+     '    LOOP\n'
+     '      SET x = x + 1;\n'
+     '    END LOOP;\n'
+     '  UNTIL x > 10 END REPEAT;\n'
+     'END;\n'
+     'SELECT 2;'),
+    # WHILE containing REPEAT
+    ('BEGIN\n'
+     '  WHILE x < 5 DO\n'
+     '    REPEAT\n'
+     '      SET y = y + 1;\n'
+     '    UNTIL y > 3 END REPEAT;\n'
+     '  END WHILE;\n'
+     'END;\n'
+     'SELECT 2;'),
+    # REPEAT containing REPEAT
+    ('BEGIN\n'
+     '  REPEAT\n'
+     '    REPEAT\n'
+     '      SET x = x + 1;\n'
+     '    UNTIL x > 5 END REPEAT;\n'
+     '  UNTIL x > 10 END REPEAT;\n'
+     'END;\n'
+     'SELECT 2;'),
+    # REPEAT containing a nested BEGIN ... END
+    ('CREATE PROCEDURE p()\n'
+     'BEGIN\n'
+     '  REPEAT\n'
+     '    BEGIN\n'
+     '      SET x = x + 1;\n'
+     '    END;\n'
+     '  UNTIL x > 10 END REPEAT;\n'
+     'END;\n'
+     'SELECT 2;'),
+])
+def test_split_repeat_nested(sql):
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2, stmts
+    assert stmts[-1] == 'SELECT 2;'
+
+
+@pytest.mark.parametrize('until', [
+    # CASE expression inside the UNTIL condition
+    '(CASE WHEN x > 10 THEN 1 ELSE 0 END) = 1',
+    'NOT (CASE WHEN x > 10 THEN x ELSE 0 END = x)',
+    # multi-line CASE without parentheses
+    'CASE\n    WHEN x > 10 THEN TRUE\n    ELSE FALSE\n  END',
+    # subquery in the condition
+    '(SELECT COUNT(*) FROM t WHERE t.x = x) > 5',
+])
+def test_split_repeat_until_expression(until):
+    """END tokens inside the UNTIL condition must not close the block."""
+    for template in (
+        ('BEGIN\n  REPEAT\n    SET x = x + 1;\n  UNTIL {until} END REPEAT;\n'
+         'END;\nSELECT 2;'),
+        ('REPEAT\n  SET x = x + 1;\nUNTIL {until} END REPEAT;\nSELECT 2;'),
+    ):
+        sql = template.format(until=until)
+        stmts = sqlparse.split(sql)
+        assert len(stmts) == 2, (until, stmts)
+        assert stmts[-1] == 'SELECT 2;'
+        assert 'END REPEAT;' in stmts[0]
+
+
+def test_split_repeat_case_in_body():
+    """A CASE expression in the REPEAT body must not unbalance the block."""
+    sql = ('CREATE PROCEDURE p()\n'
+           'BEGIN\n'
+           '  REPEAT\n'
+           '    SET x = CASE WHEN y > 0 THEN 1 ELSE 2 END;\n'
+           '  UNTIL x > 10 END REPEAT;\n'
+           'END;\n'
+           'SELECT 2;')
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2
+    assert stmts[1] == 'SELECT 2;'
+
+
+def test_split_repeat_single_statement():
+    """MySQL allows a body statement without a trailing semicolon."""
+    sql = 'REPEAT SET x = x + 1 UNTIL x > 10 END REPEAT;\nSELECT 2;'
+    stmts = sqlparse.split(sql)
+    assert stmts == ['REPEAT SET x = x + 1 UNTIL x > 10 END REPEAT;',
+                     'SELECT 2;']
+
+
+def test_split_repeat_labelled():
+    sql = 'lbl: REPEAT\n  SET x = x + 1;\nUNTIL x > 10 END REPEAT lbl;\n' \
+          'SELECT 2;'
+    stmts = sqlparse.split(sql)
+    assert stmts == [
+        'lbl: REPEAT\n  SET x = x + 1;\nUNTIL x > 10 END REPEAT lbl;',
+        'SELECT 2;',
+    ]
+
+
+@pytest.mark.parametrize('sql, last', [
+    # REPEAT is also MySQL's string function.
+    ("SELECT REPEAT('a', 3);\nSELECT 1;", 'SELECT 1;'),
+    ("REPEAT('a', 3);\nSELECT 1;", 'SELECT 1;'),
+    # ... and a perfectly valid column / variable name.
+    ('SELECT repeat FROM t;\nSELECT 1;', 'SELECT 1;'),
+    ('CREATE TABLE t (repeat int);\nSELECT 1;', 'SELECT 1;'),
+    ('REPEAT.member = 1;\nSELECT 2;', 'SELECT 2;'),
+    ('REPEAT[1] = 1;\nSELECT 2;', 'SELECT 2;'),
+    ('REPEAT := 1;\nSELECT 2;', 'SELECT 2;'),
+    # ... and a bare expression inside an enclosing CASE.
+    ('SELECT CASE WHEN a THEN repeat ELSE 0 END AS x;\nSELECT 2;',
+     'SELECT 2;'),
+])
+def test_split_repeat_lookalike(sql, last):
+    """REPEAT used as a function or name must not open a block."""
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2, stmts
+    assert stmts[-1] == last
+
+
+def test_split_repeat_variable_in_procedure():
+    sql = ('CREATE PROCEDURE p()\n'
+           'BEGIN\n'
+           '  DECLARE repeat INT;\n'
+           '  SET repeat = 1;\n'
+           'END;\n'
+           'SELECT 1;')
+    stmts = sqlparse.split(sql)
+    assert len(stmts) == 2
+    assert stmts[1] == 'SELECT 1;'
+
+
+def test_split_repeat_procedure_body_without_begin():
+    """MySQL allows a routine body without BEGIN ... END.
+
+    The routine header and the REPEAT block stay together, and the
+    standalone-block shape splits the same way as inside a BEGIN body.
+    """
+    sql = ('CREATE PROCEDURE p()\n'
+           'REPEAT\n'
+           '  SET x = x + 1;\n'
+           'UNTIL x > 10 END REPEAT;\n'
+           'SELECT 2;')
+    stmts = sqlparse.split(sql)
+    assert stmts == ['CREATE PROCEDURE p()\n'
+                     'REPEAT\n'
+                     '  SET x = x + 1;\n'
+                     'UNTIL x > 10 END REPEAT;',
+                     'SELECT 2;']
+
+
